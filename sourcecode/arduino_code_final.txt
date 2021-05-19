@@ -1,0 +1,1319 @@
+/*
+Update Log:
+>
+*/
+#include <stdlib.h>
+#include <ros.h>
+#include <std_msgs/Int16.h>
+#include <SoftwareSerial.h> //Library Used for Bluetooth Module Communication
+#include <SPI.h>            //Library Used to communicate with Encoder Buffer Board
+#include <PID_v1.h>         //Library Used for PID tuning of the Motors
+#include <Wire.h> //Library which allows I2C communication.
+#include <Adafruit_PWMServoDriver.h> //This library must be downloaded to run the code.
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();//Instantiating objects with the Adafruit_PWMServoDriver class.
+ 
+#define MIN_PULSE_WIDTH 650   //These are the minimum and maximum wavelength values which serve MG 995.
+#define MAX_PULSE_WIDTH 2350
+#define DEFAULT_PULSE_WIDTH 1500
+#define FREQUENCY 60
+
+#define MC_RX 69
+#define MC_TX 14
+
+SoftwareSerial BT(MC_RX, MC_TX); //RX: 10, 11, 12, 13, 14, 15, 50, 51, 52, 53, A8 (62), A9 (63), A10 (64), A11 (65), A12 (66), A13 (67), A14 (68), A15 (69)
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+
+typedef struct Wheel
+{
+  long EncCount;
+  long priorCount;
+  long totalCount;
+  double mSpeed; //Speed in deg/s
+  int inA;
+  int inB;
+  int PWM;
+  byte mDC;
+}wheel;
+
+typedef struct Actuator
+{
+  int R_PWM;
+  int L_PWM;
+  int FB;
+  byte aDC;  
+}actuator;
+
+/*Variables used throughout code*/
+boolean driveMode, liftMode, pushMode, updateMode, newCMD, precisionMode;
+byte dutyCycle, _25DC, halfDC, _75DC, maxDC, DC_Level[5], upDC, downDC, driveSpeed;
+int accelVal, decelVal, interval, iteration, DCstate;
+unsigned long currentTime, previousTime, t, T, dT, microInterval, encTestTime;
+int btStatus, actStatus, EncS1A, EncS2A, EncS1B, EncS2B; 
+int FBmin, FBmax;
+int btVal, nanoVal, currentCMD, previousCMD, priorVal = 0;
+
+//Command List:
+/*Driving Direction/Action*/
+const int nw = 1, n = 2, ne = 3, w = 4, mStop = 5, e = 6, sw = 7, s = 8, se = 9, cw = 10, ccw = 11;
+/*Lift Actuator Direction/Action*/
+const int up = 21, down = 23, aStop = 25;
+/*Push Actuator Direction/Action*/
+const int forward = 31, backward = 33, topStop = 35;
+/*Variable Change*/
+const int incDC = 41, decDC = 42, incAccel = 43, decAccel = 44, updateStop = 45, incDecel = 46, decDecel = 47; 
+/*Finger  Commands*/
+const int retrievalAction = 95,  retrievalActionStop = 94, fingerOpen = 96, fingerClose = 97;
+/*Encoder and Wheel Variables:*/
+const float pi = 3.14159;
+const float wheelRadius = 0.0762;//In meters. 3in = 0.0762m
+const double CPR = 1103.73;
+const double degPerCount = 360.0/CPR;
+float distanceCovered;
+
+//PID Parameters
+double aSetpoint, aInput, aOutput, wSetpoint, wInput, wOutput;
+double kp_act = 175.0, ki_act = 2.0, kd_act = 0.05; //!!!Practically Good, but needs to be tuned for perfection
+double kp_wh = 0.25, ki_wh = 1.1, kd_wh = 0.11;//!!!Needs to be tuned!!!
+PID wFLPID(&wInput, &wOutput, &wSetpoint, kp_wh, ki_wh, kd_wh, DIRECT);
+PID wFRPID(&wInput, &wOutput, &wSetpoint, kp_wh, ki_wh, kd_wh, DIRECT);
+PID wRLPID(&wInput, &wOutput, &wSetpoint, kp_wh, ki_wh, kd_wh, DIRECT);
+PID wRRPID(&wInput, &wOutput, &wSetpoint, kp_wh, ki_wh, kd_wh, DIRECT);
+PID aFLPID(&aInput, &aOutput, &aSetpoint, kp_act, ki_act, kd_act, DIRECT);
+PID aFRPID(&aInput, &aOutput, &aSetpoint, kp_act, ki_act, kd_act, DIRECT);
+PID aRRPID(&aInput, &aOutput, &aSetpoint, kp_act, ki_act, kd_act, DIRECT);
+
+//Struct Declaration
+wheel wheelFL;
+wheel wheelFR;
+wheel wheelRL;
+wheel wheelRR;
+
+actuator actFL;
+actuator actFR;
+actuator actRL;
+actuator actRR;
+actuator actTop;
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+
+void light_cb( const std_msgs::Int16& light_cmd){
+    currentCMD = light_cmd.data;  
+}
+
+ros::NodeHandle  nh;
+ros::Subscriber<std_msgs::Int16> sub("blinkm" , light_cb);
+
+
+
+
+
+
+void setup() {
+  
+  Serial.begin(115200);//!!!Change to 9600 if necessary, but performs better at this Baud rate. Serial.print shouldn't be used in final Version
+  BT.begin(9600);//!!!Might need to reconfigure Baud Rate for better, less laggy performance. Must be done through AT commands
+  
+  declarePin();
+  pwm.begin();  //Initialize the library and send PWM signals.
+  pwm.setPWMFreq(FREQUENCY); //Servo's update frequency at 60 Hertz.
+  pwm.setPWM(0,0,pulseWidth(90)); 
+  pwm.setPWM(1,0,pulseWidth(90)); 
+  initValues();
+  setPWMfrequency(0x03,0x04,0x03); //Default Values
+  initEncoders();
+  for(iteration = 30; iteration < 34; ++iteration)
+  {
+    clearEncoderCount(iteration);
+  }
+  fullyRetract();
+  allMotorOff();
+  configPID();
+  isPrecisionMode();
+  nh.initNode();
+  nh.subscribe(sub);
+}
+
+void loop() {
+  
+  //if(isBTConnected()) BTreading();
+  //else allMotorOff();
+
+  light_cb;
+  fingerControl(currentCMD);
+  // retrieval();
+  isolateAction(); 
+  determineAction();
+  nh.spinOnce();
+}
+
+int pulseWidth(int angle){ //This function calculates servo's motion angle.
+int pulse_wide, analog_value;
+pulse_wide = map(angle, 0, 180, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH); //This function get angle from 0 to 180 degrees and map from length minimum value to maximum. 
+analog_value = int(float(pulse_wide) / 1000000 * FREQUENCY * 4096);
+
+return analog_value; //The value this function returns.
+
+}
+
+void fingerControl(int instruction){
+  if(instruction == fingerOpen){
+    pwm.setPWM(0,0,pulseWidth(90));
+    pwm.setPWM(1,0,pulseWidth(90)); 
+  }
+  if(instruction == fingerClose){
+    pwm.setPWM(0,0,pulseWidth(180));
+    pwm.setPWM(1,0,pulseWidth(0)); 
+  }
+}
+
+void retrieval(){
+  if(currentCMD == retrievalAction){
+    fingerControl(fingerOpen);
+    topDirectionControl(forward);
+    delay(10000);
+    fingerControl(fingerClose);
+    delay(500);
+    topDirectionControl(backward);
+    delay(10000);
+    topDirectionControl(topStop);
+    fingerControl(fingerOpen);
+  } if(currentCMD == retrievalActionStop){
+    topDirectionControl(topStop);
+    fingerControl(fingerOpen);
+  }
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Preconfiguring Code:
+/*Used to change the frequency of the PWM pins of the Arduino MEGA*/
+void setPWMfrequency(int freq1, int freq2, int freq3)
+{
+  TCCR0B = TCCR0B & 0b11111000 | freq3 ; // For D4 & D13 (Default = ~977Hz)
+  TCCR1B = TCCR1B & 0b11111000 | freq1 ; // For D11 & D12 (Default = ~490Hz)
+  TCCR2B = TCCR2B & 0b11111000 | freq2 ; // For D9 & D10 (Default = ~490Hz)
+  TCCR4B = TCCR4B & 0b11111000 | freq1 ; // For D2, D3, D5, D6, D7, & D8 (Default = ~490Hz) /*Exclusive to the MEGA*/
+  TCCR5B = TCCR5B & 0b11111000 | freq1 ; // For D44, D45, D46 (Default = ~490Hz) /*Exclusive to the MEGA*/
+}
+
+/*Used to set values of the given Variables Prior to beginning the program*/
+void initValues()
+{
+  currentCMD = 0;
+  previousCMD = currentCMD;
+  newCMD = false;
+  driveMode = false;
+  liftMode = false;
+  pushMode = false;
+  updateMode = false;
+  precisionMode = true;
+
+
+  currentTime = 0;
+  previousTime = currentTime;
+  interval = 1000;
+  microInterval = 10000; //Lowering increases Accuracy but might decrease performance
+  t = 0;
+  dT = 0;
+
+  /*Used to Clip the min and max value that are read by the actuators*/
+  FBmin = 52;
+  FBmax = 495;
+
+  /*Decreasing the value increases the rate*/
+  accelVal = 20; 
+  decelVal = 2;
+
+  /*Speed Levels, ranging from 0% to 100% of max speed*/
+  dutyCycle = 0;
+  _25DC = 64;
+  halfDC = 127;
+  _75DC = 191;
+  maxDC = 255; 
+  driveSpeed = halfDC;
+  upDC = 175;
+  downDC = 150;
+ 
+
+  distanceCovered = 0;
+  
+  wheelFL.EncCount = 0; wheelFL.priorCount = 0; 
+  wheelFR.EncCount = 0; wheelFR.priorCount = 0; 
+  wheelRL.EncCount = 0; wheelRL.priorCount = 0;  
+  wheelRR.EncCount = 0; wheelRR.priorCount = 0;
+}
+
+void declarePin()
+{
+//RL           FL           RR           FR
+  EncS1A = 32, EncS2A = 30, EncS1B = 33, EncS2B = 31;
+  btStatus = 40;
+
+  wheelFL.inA = 22; wheelFL.inB = 23; wheelFL.PWM = 12;
+  wheelFR.inA = 24; wheelFR.inB = 25; wheelFR.PWM = 11;
+  wheelRL.inA = 26; wheelRL.inB = 27; wheelRL.PWM = 10;
+  wheelRR.inA = 28; wheelRR.inB = 29; wheelRR.PWM = 9;
+  
+  actFL.L_PWM = 7; actFL.R_PWM = 8; actFL.FB = 0;  //A2
+  actFR.L_PWM = 5; actFR.R_PWM = 6; actFR.FB = 0;  //A3
+  actRL.L_PWM = 45; actRL.R_PWM = 44; actRL.FB = 0;//A0
+  actRR.L_PWM = 2; actRR.R_PWM = 3; actRR.FB = 0;  //A1
+  actTop.L_PWM = 46; actTop.R_PWM = 4;
+  
+  pinMode(EncS1A, OUTPUT); pinMode(EncS2A, OUTPUT); pinMode(EncS1B, OUTPUT); pinMode(EncS2B, OUTPUT); //Slave Select Pins
+  pinMode(btStatus, INPUT);
+  pinMode(wheelFL.inA, OUTPUT); pinMode(wheelFL.inB, OUTPUT); pinMode(wheelFL.PWM, OUTPUT);
+  pinMode(wheelFR.inA, OUTPUT); pinMode(wheelFR.inB, OUTPUT); pinMode(wheelFR.PWM, OUTPUT);
+  pinMode(wheelRL.inA, OUTPUT); pinMode(wheelRL.inB, OUTPUT); pinMode(wheelRL.PWM, OUTPUT);
+  pinMode(wheelRR.inA, OUTPUT); pinMode(wheelRR.inB, OUTPUT); pinMode(wheelRR.PWM, OUTPUT);
+
+  pinMode(actFL.L_PWM, OUTPUT); pinMode(actFL.R_PWM, OUTPUT);
+  pinMode(actFR.L_PWM, OUTPUT); pinMode(actFR.R_PWM, OUTPUT);
+  pinMode(actRL.L_PWM, OUTPUT); pinMode(actRL.R_PWM, OUTPUT);
+  pinMode(actRR.L_PWM, OUTPUT); pinMode(actRR.R_PWM, OUTPUT);
+  pinMode(actTop.L_PWM, OUTPUT); pinMode(actTop.R_PWM, OUTPUT);
+}
+/*Preconfigures parameters for the PID controller of the motors*/
+void configPID()
+{
+  wFLPID.SetMode(AUTOMATIC);             //set PID in Auto mode
+  wFRPID.SetMode(AUTOMATIC);
+  wRLPID.SetMode(AUTOMATIC);
+  wRRPID.SetMode(AUTOMATIC);
+  aFLPID.SetMode(AUTOMATIC);
+  aFRPID.SetMode(AUTOMATIC);
+  aRRPID.SetMode(AUTOMATIC);
+  wFLPID.SetSampleTime(1);                 // Refresh rate of PID controller in milliseconds. Default time is 200 (Not recommended for robotics)
+  wFRPID.SetSampleTime(1); 
+  wRLPID.SetSampleTime(1); 
+  wRRPID.SetSampleTime(1); 
+  aFLPID.SetSampleTime(1);
+  aFRPID.SetSampleTime(1);
+  aRRPID.SetSampleTime(1);
+  wFLPID.SetOutputLimits(-255, 255);       // (Min,Max) Output value for the PWM Signal. (0,255) are default;
+  wFRPID.SetOutputLimits(-255, 255); 
+  wRLPID.SetOutputLimits(-255, 255); 
+  wRRPID.SetOutputLimits(-255, 255); 
+  aFLPID.SetOutputLimits(-255, 255); 
+  aFRPID.SetOutputLimits(-255, 255); 
+  aRRPID.SetOutputLimits(-255, 255); 
+  wFLPID.SetTunings(kp_wh, ki_wh, kd_wh); //Sets PID Gain Parameters for the given System.
+  wFRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+  wRLPID.SetTunings(kp_wh, ki_wh, kd_wh);
+  wRRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+  aFLPID.SetTunings(kp_act, ki_act, kd_act);
+  aFRPID.SetTunings(kp_act, ki_act, kd_act);
+  aRRPID.SetTunings(kp_act, ki_act, kd_act);
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Simplifies the main loop
+
+/*Retrieves Value from Bluetooth Module and assigns it to currentCMD. Also returns true if currentCMD changes values from prior iteration*/
+void BTreading()
+{
+  if(BT.available() > 0)
+  {
+    btVal = BT.read();
+  }
+  if(priorVal == btVal)
+  {
+    newCMD = false;
+  }
+  else if(priorVal != btVal)
+  {
+    newCMD = true;
+    priorVal = btVal;
+  }
+  currentCMD = btVal;
+}
+
+/*Based on the value retrieved from BT module or Nano, will set a certain function*/
+//!!!Need to tune so that no system perform at the same time
+void isolateAction()
+{
+  int q = currentCMD;
+  
+  if((isCompleteStop())&&(!updateMode))
+  {
+    if((q == nw)||(q == n)||(q == ne)||(q == w)||(q == mStop)||(q == e)||(q == sw)||(q == s)||(q == se)||(q == cw)||(q == ccw))
+    {
+      driveMode = true;
+      liftMode = false;
+      pushMode = false;
+      updateMode = false;
+    }
+    else if((q == up)||(q == down)||(q == aStop))
+    {
+      driveMode = false;
+      liftMode = true;
+      pushMode = false;
+      updateMode = false;
+    }
+    else if((q == forward)||(q == backward)||(q == topStop))
+    {
+      driveMode = false;
+      liftMode = false;
+      pushMode = true;
+      updateMode = false;
+    }
+    else if((q == incDC)||(q == decDC)||(q == incAccel)||(q == decAccel)||(q == updateStop)||(q == incDecel)||(q == decDecel))
+    {
+      driveMode = false;
+      liftMode = false;
+      pushMode = false;
+      updateMode = true;
+    }
+    else
+    {
+      driveMode = false;
+      liftMode = false;
+      pushMode = false;
+      updateMode = false;
+    }
+  }
+}
+
+void determineAction()
+{
+  if(driveMode && !liftMode && !pushMode && !updateMode)
+  {
+    wheelData();
+    wheelDirection();
+  }
+  else if(!driveMode && liftMode && !pushMode && !updateMode)
+  {
+    actDirection();
+  }
+  else if(!driveMode && !liftMode && pushMode && !updateMode)
+  {
+    topDirection();
+  }
+  else if(!driveMode && !liftMode && !pushMode && updateMode)
+  {
+    modifyPerformance();
+  }
+}
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Part of updateMode
+/*These two functions are used to incorporate an acceleration/deceleration factor on to the wheel motor's master and top actuator*/
+void accelerate(byte _DC)
+{
+  static unsigned long lastAccelTime = 0;
+  currentTime = millis();
+
+  if (currentTime - lastAccelTime > accelVal) 
+  {
+    lastAccelTime = currentTime;
+    if(dutyCycle == 0)
+    {
+      dutyCycle = 8; 
+    }
+    else if(dutyCycle < _DC) 
+    {
+      ++dutyCycle;
+    }
+  }  
+}
+
+void decelerate()
+{
+  static unsigned long lastDecelTime = 0;
+  currentTime = millis();
+
+  if (currentTime - lastDecelTime > decelVal) 
+  {
+    lastDecelTime = currentTime;
+    if(dutyCycle > 0) 
+    {
+      --dutyCycle; //Consider 'dutyCycle = dutyCycle/1.01;' for a 1% decrease per iteration for a smoother Stop
+    }
+  }
+}
+
+void isPrecisionMode()
+{
+  if (precisionMode)
+  {
+    upDC = 100;
+    downDC = 75;
+    driveSpeed = 32;
+    if((kp_act = 18.5)||(ki_act = 3.75)||(kd_act = 0.0))
+    {
+      kp_act = 18.5; ki_act = 3.75; kd_act = 0.0;
+      aFLPID.SetTunings(kp_act, ki_act, kd_act);
+      aFRPID.SetTunings(kp_act, ki_act, kd_act);
+      aRRPID.SetTunings(kp_act, ki_act, kd_act);
+    }
+    if((kp_wh != 0.25)||(ki_wh != 0.95)||(kd_wh != 0.0))
+    {
+      kp_wh = 0.25; ki_wh = 1.1; kd_wh = 0.0;
+      wFLPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wFRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wRLPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wRRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+    }
+  }
+  else
+  {
+    upDC = 170;
+    downDC = 150;
+    driveSpeed = halfDC;
+    if((kp_act != 175.0)||(ki_act != 2.0)||(kd_act != 0.05))
+    {
+      kp_act = 175.0; ki_act = 2.0; kd_act = 0.05;
+      aFLPID.SetTunings(kp_act, ki_act, kd_act);
+      aFRPID.SetTunings(kp_act, ki_act, kd_act);
+      aRRPID.SetTunings(kp_act, ki_act, kd_act);
+    }
+    if((kp_wh != 0.25)||(ki_wh != 1.1)||(kd_wh != 0.11))
+    {
+      kp_wh = 0.25; ki_wh = 1.1; kd_wh = 0.0;
+      wFLPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wFRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wRLPID.SetTunings(kp_wh, ki_wh, kd_wh);
+      wRRPID.SetTunings(kp_wh, ki_wh, kd_wh);
+    }
+  }
+}
+
+void modifyPerformance()
+{
+  switch(currentCMD)
+  {
+    case incDC:
+    precisionMode = false;
+    isPrecisionMode();
+    break;
+
+    case decDC:
+    precisionMode = true;
+    isPrecisionMode();
+    break;
+
+    case updateStop:
+    updateMode = false;
+    break;
+  }
+}
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Functions Pertaining to Wheel Motors
+
+void wheelDirection()
+{
+  
+  switch(currentCMD)
+   {
+    case nw:                      //Reads Driving command
+    accelerate(driveSpeed);       //Increases Global Duty Cycle variable [dutyCycle] at designated rate
+    wheelRL.mDC = dutyCycle;      //Applies duty cycle to Master Wheel motor
+    wheelProtocol(nw);            //Adjust the speed of slave motors based on PID output
+    driveNW();                    //Drives the motors based on the HIGH/LOW value of the pins and applied duty cycle of the analog output.
+    previousCMD = currentCMD;     //Stores the previous value ofhe current command before ending the current iteration. Used for the stop command for deceleration and other purposes.
+    break;
+    
+    case n:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(n);
+    driveN();
+    previousCMD = currentCMD;
+    break;
+    
+    case ne:
+    accelerate(driveSpeed);
+    wheelRR.mDC = dutyCycle;
+    wheelProtocol(ne);
+    driveNE();
+    previousCMD = currentCMD;
+    break;
+    
+    case w:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(w);
+    driveW();
+    previousCMD = currentCMD;
+    break;
+    
+    case mStop:
+    if(dutyCycle > 0) //Continues the prior command while the duty cycle begins to decrease and stops when dutyCycle == 0;
+    {
+      decelerate();
+      if((previousCMD == ne)||(previousCMD == sw))
+      {
+        wheelRR.mDC = dutyCycle;
+        wheelProtocol(previousCMD);
+        if(previousCMD == ne) driveNE();
+        else if(previousCMD == sw) driveSW();
+      }
+      else
+      {
+        wheelRL.mDC = dutyCycle;
+        wheelProtocol(previousCMD);
+        if(previousCMD == n) driveN();
+        else if(previousCMD == s) driveS();
+        else if(previousCMD == w) driveW();
+        else if(previousCMD == e) driveE();
+        else if(previousCMD == cw) driveCW();
+        else if(previousCMD == ccw) driveCCW();
+        else if(previousCMD == se) driveSE();
+        else if(previousCMD == nw) driveNW();
+      }
+    }
+    else if(dutyCycle == 0)                                                                                                               //Once the duty cycle reaches 0...
+    {
+      driveStop();                                                                                                                        //All drive pins go LOW and all duty cycle values reset to zero
+      /*
+      if(distanceCovered != displacementAvg(wheelFL.totalCount, wheelFR.totalCount, wheelRL.totalCount, wheelRR.totalCount, previousCMD)) //Returns the distance displaced during movement
+      {                                                                                                                           
+        distanceCovered = displacementAvg(wheelFL.totalCount, wheelFR.totalCount, wheelRL.totalCount, wheelRR.totalCount, previousCMD);
+        Serial.print(distanceCovered); Serial.println(" m");
+      }
+      */                                                                              
+      resetCount();                                                                                                                       //Resets distance displaced
+      for(iteration = 30; iteration < 34; ++iteration)
+      {
+        clearEncoderCount(iteration);                                                                                                     //Resets encoder value in the encoder buffer board
+      }
+      previousCMD = currentCMD;
+    }
+    break;
+    
+    case e:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(e);
+    driveE();
+    previousCMD = currentCMD;
+    break;
+    
+    case sw:
+    accelerate(driveSpeed);
+    wheelRR.mDC = dutyCycle;
+    wheelProtocol(sw);
+    driveSW();
+    previousCMD = currentCMD;
+    break;
+    
+    case s:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(s);
+    driveS();
+    previousCMD = currentCMD;
+    break;
+    
+    case se:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(se);
+    driveSE();
+    previousCMD = currentCMD;
+    break;
+    
+    case cw:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(cw);
+    driveCW();
+    previousCMD = currentCMD;
+    break;
+    
+    case ccw:
+    accelerate(driveSpeed);
+    wheelRL.mDC = dutyCycle;
+    wheelProtocol(ccw);
+    driveCCW();
+    previousCMD = currentCMD;
+    break;
+   }  
+}
+
+//PID Implementation for wheel motors
+void wheelProtocol(int setting)
+{
+  
+  for(int i = 0; i < 3; ++i)
+  {
+    if((setting == ne)||(setting == sw))
+    {
+      wSetpoint = wheelRR.mSpeed;         //Takes the current speed/position of the master
+      wInput = wheelFL.mSpeed;            //Takes the current speed/position of the slaves
+      wFLPID.Compute();                     //Uses algorithm to determine a new duty cycle value for given slave, based on the error value (Setpoint - input)
+      if(wOutput < 0) wOutput = -wOutput;
+      wheelFL.mDC = wOutput;              //Assign new, output duty cycle to the given slave
+      break;
+    }
+    else if((setting == nw)||(setting == se))
+    {
+      wSetpoint = wheelRL.mSpeed;
+      wInput = wheelFR.mSpeed;
+      wFRPID.Compute();
+      if(wOutput < 0) wOutput = -wOutput;
+      wheelFR.mDC = wOutput;
+      break;
+    }
+    else
+    {
+      wSetpoint = wheelRL.mSpeed;
+      if(i == 0)
+      {
+        wInput = wheelFL.mSpeed;
+        wFLPID.Compute();
+        if(wOutput < 0) wOutput = -wOutput;
+        wheelFL.mDC = wOutput;
+      }
+      if(i == 1)
+      {
+        wInput = wheelFR.mSpeed;
+        wFRPID.Compute();
+        if(wOutput < 0) wOutput = -wOutput;
+        wheelFR.mDC = wOutput;
+      }
+      if(i == 2)
+      {
+        wInput = wheelRR.mSpeed;
+        wRRPID.Compute();
+        if(wOutput < 0) wOutput = -wOutput;
+        wheelRR.mDC = wOutput;
+      } 
+    }
+  }
+}
+
+
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Functions Pertaining to Actuator Motors
+
+void actDirection()
+{
+  switch(currentCMD)
+  {
+    case up:
+    readLevel();
+    if(isPastLimit() == true)
+    {
+      platformStop();
+      previousCMD = currentCMD;
+      break;
+    }
+    actRL.aDC = dutyCycle = upDC;
+    actProtocol();
+    platformUp();
+    previousCMD = currentCMD;
+    break;
+    
+    case down:
+    readLevel();
+    actRL.aDC = dutyCycle = downDC;
+    actProtocol();
+    platformDown();
+    previousCMD = currentCMD;
+    break;
+
+    case aStop:
+    platformStop();
+    previousCMD = currentCMD;
+    break;
+  }
+}
+
+/*Reads the current position/level of the lift actuator and clips the minimum and maximum level so they're all equal (for other functions).*/
+void readLevel()
+{
+  actFL.FB = analogRead(56); actFL.FB = constrain(actFL.FB, FBmin, FBmax); 
+  actFR.FB = analogRead(57); actFR.FB = constrain(actFR.FB, FBmin, FBmax);
+  actRL.FB = analogRead(54); actRL.FB = constrain(actRL.FB, FBmin, FBmax);
+  actRR.FB = analogRead(55); actRR.FB = constrain(actRR.FB, FBmin, FBmax);
+}
+
+void fullyRetract()
+{
+  static int lError = 2;
+  readLevel();
+  T = millis();
+  while(!((actFL.FB < FBmin + lError)&&(actFR.FB < FBmin + lError)&&(actRL.FB < FBmin + lError)&&(actRR.FB < FBmin + lError)))
+  {
+    actFL.aDC = halfDC;
+    actFR.aDC = halfDC;
+    actRL.aDC = halfDC;
+    actRR.aDC = halfDC;
+    platformDown_NoMaster();
+    readLevel();
+    if((millis() - T >= 10000)) break;
+  }
+}
+
+//PID Implementation
+void actProtocol()
+{
+  aSetpoint = (double)actRL.FB;//Master
+  for(int a = 0; a < 3; ++a)
+  {
+    if(a == 0)
+    {
+      aInput = (double)actFL.FB;
+      aFLPID.Compute();
+      aOutput = adjustDutyCycle(aOutput,actRL.FB,actFL.FB);
+      actFL.aDC = aOutput;
+    }
+    if(a == 1)
+    {
+      aInput = (double)actFR.FB;
+      aFRPID.Compute();
+      aOutput = adjustDutyCycle(aOutput,actRL.FB,actFR.FB);
+      actFR.aDC = aOutput;
+    }
+    if(a == 2)
+    {
+      aInput = (double)actRR.FB;
+      aRRPID.Compute();
+      aOutput = adjustDutyCycle(aOutput,actRL.FB,actRR.FB);
+      actRR.aDC = aOutput;
+    } 
+  }
+}
+
+
+byte adjustDutyCycle(byte p, int set, int in)
+{
+  if(currentCMD == down) 
+  {
+    if (set - in >= 0) return p;
+    else return -p;
+  }
+  else return p;
+}
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Functions Pertaining to Push Actuator Motors
+
+void topDirection()
+{
+  
+  switch(currentCMD)
+  {
+    case forward:
+    accelerate(225);
+    extendAct();
+    previousCMD = currentCMD;
+    break;
+
+    case backward:
+    accelerate(maxDC);
+    retractAct();
+    previousCMD = currentCMD;
+    break;
+
+    case topStop:
+    if(dutyCycle != 0)
+    {
+      decelerate();
+      if(previousCMD == forward) extendAct();
+      if(previousCMD == backward) retractAct();
+    }
+    else if(dutyCycle == 0)
+    {
+      stopTopAct();
+      previousCMD = currentCMD;
+    }
+    break;
+  }
+}
+
+
+void topDirectionControl(int instruction)
+{
+  
+  switch(instruction)
+  {
+    case forward:
+    accelerate(225);
+    extendAct();
+    previousCMD = currentCMD;
+    break;
+
+    case backward:
+    accelerate(maxDC);
+    retractAct();
+    previousCMD = currentCMD;
+    break;
+
+    case topStop:
+    if(dutyCycle != 0)
+    {
+      decelerate();
+      if(previousCMD == forward) extendAct();
+      if(previousCMD == backward) retractAct();
+    }
+    else if(dutyCycle == 0)
+    {
+      stopTopAct();
+      previousCMD = currentCMD;
+    }
+    break;
+  }
+}
+/*-----------------------------------------------------------------------------------------------------------------------------------------------------------------------*/
+//Functions that control the direction in which all motors rotate
+void resetDutyCycle()
+{
+  actFL.aDC = 0; actFR.aDC = 0; actRL.aDC = 0; actRR.aDC = 0;
+  wheelFL.mDC = 0; wheelFR.mDC = 0; wheelRL.mDC = 0; wheelRR.mDC = 0;
+  dutyCycle = 0;
+}
+
+void allMotorOff()
+{
+  resetDutyCycle();
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, LOW); digitalWrite(wheelFL.PWM, LOW);
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, LOW); digitalWrite(wheelFR.PWM, LOW);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, LOW); digitalWrite(wheelRL.PWM, LOW);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, LOW); digitalWrite(wheelRR.PWM, LOW);
+  digitalWrite(actFL.R_PWM, LOW); digitalWrite(actFL.L_PWM, LOW);
+  digitalWrite(actFR.R_PWM, LOW); digitalWrite(actFR.L_PWM, LOW);
+  digitalWrite(actRL.R_PWM, LOW); digitalWrite(actRL.L_PWM, LOW);
+  digitalWrite(actRR.R_PWM, LOW); digitalWrite(actRR.L_PWM, LOW);
+  digitalWrite(actTop.R_PWM, LOW); digitalWrite(actTop.L_PWM, LOW);
+}
+
+void driveN() 
+{
+  digitalWrite(wheelFL.inA, HIGH); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, 30); 
+  digitalWrite(wheelFR.inA, HIGH); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, HIGH); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, 30);
+  digitalWrite(wheelRR.inA, HIGH); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, 30);
+}
+
+void driveS() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, HIGH); analogWrite(wheelFL.PWM, 30); 
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, HIGH); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, HIGH); analogWrite(wheelRL.PWM, 30);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, HIGH); analogWrite(wheelRR.PWM, 30);
+}
+
+void driveE() 
+{
+  digitalWrite(wheelFL.inA, HIGH); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM,30);
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, HIGH); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, HIGH); analogWrite(wheelRL.PWM,30);
+  digitalWrite(wheelRR.inA, HIGH); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM,30);
+}
+
+void driveW() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, HIGH); analogWrite(wheelFL.PWM, 30);
+  digitalWrite(wheelFR.inA, HIGH); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, HIGH); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, 30);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, HIGH); analogWrite(wheelRR.PWM, 30);
+}
+
+void driveCW() 
+{
+  digitalWrite(wheelFL.inA, HIGH); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, 30); 
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, HIGH); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, HIGH); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, 30);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, HIGH); analogWrite(wheelRR.PWM, 30);
+}
+
+void driveCCW() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, HIGH); analogWrite(wheelFL.PWM, 30);
+  digitalWrite(wheelFR.inA, HIGH); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, 30);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, HIGH); analogWrite(wheelRL.PWM, 30);
+  digitalWrite(wheelRR.inA, HIGH); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, 30);
+}
+
+void driveNW() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, wheelFL.mDC); 
+  digitalWrite(wheelFR.inA, HIGH); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, wheelFR.mDC);
+  digitalWrite(wheelRL.inA, HIGH); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, wheelRL.mDC);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, wheelRR.mDC);
+}
+
+void driveNE() 
+{
+  digitalWrite(wheelFL.inA, HIGH); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, wheelFL.mDC);
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, wheelFR.mDC);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, wheelRL.mDC);
+  digitalWrite(wheelRR.inA, HIGH); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, wheelRR.mDC);
+}
+
+void driveSW() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, HIGH); analogWrite(wheelFL.PWM, wheelFL.mDC);
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, wheelFR.mDC);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, wheelRL.mDC);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, HIGH); analogWrite(wheelRR.PWM, wheelRR.mDC);
+}
+
+void driveSE() 
+{
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, wheelFL.mDC);
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, HIGH); analogWrite(wheelFR.PWM, wheelFR.mDC);
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, HIGH); analogWrite(wheelRL.PWM, wheelRL.mDC);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, wheelRR.mDC);
+}
+
+void driveStop()
+{
+  resetDutyCycle();
+  digitalWrite(wheelFL.inA, LOW); digitalWrite(wheelFL.inB, LOW); analogWrite(wheelFL.PWM, 0); 
+  digitalWrite(wheelFR.inA, LOW); digitalWrite(wheelFR.inB, LOW); analogWrite(wheelFR.PWM, 0); 
+  digitalWrite(wheelRL.inA, LOW); digitalWrite(wheelRL.inB, LOW); analogWrite(wheelRL.PWM, 0);
+  digitalWrite(wheelRR.inA, LOW); digitalWrite(wheelRR.inB, LOW); analogWrite(wheelRR.PWM, 0);  
+}
+
+void platformDown_NoMaster()
+{
+  analogWrite(actFL.R_PWM, actFL.aDC); digitalWrite(actFL.L_PWM, LOW);
+  analogWrite(actFR.R_PWM, actFR.aDC); digitalWrite(actFR.L_PWM, LOW);
+  analogWrite(actRL.R_PWM, actRL.aDC); digitalWrite(actRL.L_PWM, LOW);
+  analogWrite(actRR.R_PWM, actRR.aDC); digitalWrite(actRR.L_PWM, LOW);
+}
+
+void platformDown()
+{
+  analogWrite(actRL.R_PWM, actRL.aDC); digitalWrite(actRL.L_PWM, LOW);
+  
+  if(actRL.FB >= actFL.FB)
+  {
+    analogWrite(actFL.L_PWM, actFL.aDC);
+    digitalWrite(actFL.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actFL.R_PWM, actFL.aDC);
+    digitalWrite(actFL.L_PWM, LOW);
+  }
+  if(actRL.FB >= actFR.FB)
+  {
+    analogWrite(actFR.L_PWM, actFR.aDC);
+    digitalWrite(actFR.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actFR.R_PWM, actFR.aDC);
+    digitalWrite(actFR.L_PWM, LOW);
+  }
+  if(actRL.FB >= actRR.FB)
+  {
+    analogWrite(actRR.L_PWM, actRR.aDC);
+    digitalWrite(actRR.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actRR.R_PWM, actRR.aDC);
+    digitalWrite(actRR.L_PWM, LOW);
+  }
+}
+
+void platformUp()
+{
+  analogWrite(actRL.L_PWM, actRL.aDC); digitalWrite(actRL.R_PWM, LOW);
+  
+  if(actRL.FB >= actFL.FB)
+  {
+    analogWrite(actFL.L_PWM, actFL.aDC);
+    digitalWrite(actFL.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actFL.R_PWM, actFL.aDC);
+    digitalWrite(actFL.L_PWM, LOW);
+  }
+  if(actRL.FB >= actFR.FB)
+  {
+    analogWrite(actFR.L_PWM, actFR.aDC);
+    digitalWrite(actFR.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actFR.R_PWM, actFR.aDC);
+    digitalWrite(actFR.L_PWM, LOW);
+  }
+  if(actRL.FB >= actRR.FB)
+  {
+    analogWrite(actRR.L_PWM, actRR.aDC);
+    digitalWrite(actRR.R_PWM, LOW);
+  }
+  else
+  {
+    analogWrite(actRR.R_PWM, actRR.aDC);
+    digitalWrite(actRR.L_PWM, LOW);
+  }
+}
+
+void retractAct()
+{
+  analogWrite(actTop.L_PWM, dutyCycle); digitalWrite(actTop.R_PWM, LOW);
+}
+
+void extendAct()
+{
+  analogWrite(actTop.R_PWM, dutyCycle); digitalWrite(actTop.L_PWM, LOW);
+}
+
+void stopTopAct()
+{
+  resetDutyCycle();
+  digitalWrite(actTop.R_PWM, LOW); digitalWrite(actTop.L_PWM, LOW);
+}
+
+void platformStop()
+{
+  resetDutyCycle();
+  digitalWrite(actFL.R_PWM, LOW); digitalWrite(actFL.L_PWM, LOW);
+  digitalWrite(actFR.R_PWM, LOW); digitalWrite(actFR.L_PWM, LOW);
+  digitalWrite(actRL.R_PWM, LOW); digitalWrite(actRL.L_PWM, LOW);
+  digitalWrite(actRR.R_PWM, LOW); digitalWrite(actRR.L_PWM, LOW);
+}
+
+
+/************************************************************************************************************************************************************************************/
+//Boolean functions 
+boolean isBTConnected()
+{
+  if(digitalRead(btStatus) == HIGH)
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+boolean isCompleteStop()
+{
+  if(dutyCycle > 0)
+  {
+    return false;
+  }
+  else
+  {
+    return true;
+  }
+}
+
+boolean isPastLimit()
+{
+  static int upperLimit = FBmax - 4;
+  static int lowerLimit = FBmin + 4;
+
+  if((actFL.FB > upperLimit)||(actFR.FB > upperLimit)||(actRL.FB > upperLimit)||(actRR.FB > upperLimit))
+  {
+    return true;
+  }
+  else return false;
+}
+
+boolean isFullyDown()
+{
+  if(actRL.FB == FBmin) return true;
+  else return false;
+}
+/**************************************************************************************************************************************************************************************/
+//Encoder Content
+
+void initEncoders() {
+
+  // Communication begins when you drop the individual select signsl
+  digitalWrite(EncS1A,HIGH); digitalWrite(EncS2A,HIGH); digitalWrite(EncS1B,HIGH); digitalWrite(EncS2B,HIGH);
+
+  SPI.begin();
+
+  //The Following are to initialize the 4 Motor Encoder. NOTE: For more information on commands, see LS7366R datasheet
+  // Initialize encoder 1
+  digitalWrite(EncS1A,LOW);        // Begin SPI conversation
+  SPI.transfer(0x88);              // Write to MDR0
+  SPI.transfer(0x03);              // Configure to 4 byte mode
+  digitalWrite(EncS1A,HIGH);       // Terminate SPI conversation 
+
+  // Initialize encoder 2
+  digitalWrite(EncS2A,LOW);     
+  SPI.transfer(0x88);              
+  SPI.transfer(0x03);          
+  digitalWrite(EncS2A,HIGH);       
+
+  // Initialize encoder 3
+  digitalWrite(EncS1B,LOW);    
+  SPI.transfer(0x88);           
+  SPI.transfer(0x03);            
+  digitalWrite(EncS1B,HIGH);   
+
+  // Initialize encoder 4
+  digitalWrite(EncS2B,LOW);     
+  SPI.transfer(0x88);             
+  SPI.transfer(0x03);             
+  digitalWrite(EncS2B,HIGH);       
+  
+}
+
+void clearEncoderCount(int en) 
+{
+  //EncS1A = 32
+  //EncS2A = 30
+  //EncS1B = 33
+  //EncS2B = 31
+  // Set encoder1's data register to 0
+  digitalWrite(en,LOW);          // Begin SPI conversation  
+  SPI.transfer(0x98);            // Write to DTR
+  // Load data
+  SPI.transfer(0x00);            // Highest order byte
+  SPI.transfer(0x00);           
+  SPI.transfer(0x00);           
+  SPI.transfer(0x00);            // lowest order byte
+  digitalWrite(en,HIGH);         // Terminate SPI conversation 
+  delayMicroseconds(100);        // provides some breathing room between SPI conversations
+  // Set encoder1's current data register to center
+  digitalWrite(en,LOW);      // Begin SPI conversation  
+  SPI.transfer(0xE0);    
+  digitalWrite(en,HIGH);     // Terminate SPI conversation   
+}
+
+long readEncoder(int encoder) { 
+  // Initialize temporary variables for SPI read
+  unsigned int count_1, count_2, count_3, count_4;
+  long count_value;  
+  
+  digitalWrite(encoder,LOW);   
+  SPI.transfer(0x60);                    
+  count_1 = SPI.transfer(0x00);           
+  count_2 = SPI.transfer(0x00);           
+  count_3 = SPI.transfer(0x00);           
+  count_4 = SPI.transfer(0x00);           
+  digitalWrite(encoder,HIGH);   
+  
+  // Calculate encoder count
+  count_value = (count_1 << 8) + count_2;
+  count_value = (count_value << 8) + count_3;
+  count_value = (count_value << 8) + count_4;
+  
+  return count_value;
+}
+
+
+/**************************************************************************************************************************************************************************************/
+//Information from wheel/encoder
+void wheelData()
+{
+  if(micros()- encTestTime >= microInterval)
+  {
+    encTestTime = micros();
+    dT = micros() - t;
+    wheelFL.mSpeed = getSpeed(wheelFL.priorCount, wheelFL.EncCount, EncS2A, dT, wheelFL.totalCount, wheelFL.mSpeed);
+    wheelFR.mSpeed = getSpeed(wheelFR.priorCount, wheelFR.EncCount, EncS2B, dT, wheelFR.totalCount, wheelFR.mSpeed);
+    wheelRL.mSpeed = getSpeed(wheelRL.priorCount, wheelRL.EncCount, EncS1A, dT, wheelRL.totalCount, wheelRL.mSpeed);
+    wheelRR.mSpeed = getSpeed(wheelRR.priorCount, wheelRR.EncCount, EncS1B, dT, wheelRR.totalCount, wheelRR.mSpeed);
+    t = micros();
+  }
+  if(wheelFL.mSpeed < 0) wheelFL.mSpeed = -wheelFL.mSpeed;
+  if(wheelFR.mSpeed < 0) wheelFR.mSpeed = -wheelFR.mSpeed;
+  if(wheelRL.mSpeed < 0) wheelRL.mSpeed = -wheelRL.mSpeed;
+  if(wheelRR.mSpeed < 0) wheelRR.mSpeed = -wheelRR.mSpeed;
+}
+
+double getSpeed(long &oldVal, long &newVal, int encReg, unsigned long _time, long &totalVal, double oldSpeed)
+{
+  oldVal = newVal;
+  newVal = readEncoder(encReg);
+  int difference = newVal - oldVal;
+  totalVal += difference;
+  int degPerSec;  
+  if((difference > -50000)&&(difference < 50000))
+  {
+    double _timeInSec = 1000000.0/_time;
+    double countsPerSec = (double)difference*(double)_timeInSec;
+    degPerSec = countsPerSec * degPerCount;
+    oldSpeed = degPerSec;
+  }
+  else
+  {
+    degPerSec = oldSpeed;
+  }
+  return degPerSec;
+}
+float getDistance(long _total)
+{
+  double revCount = degPerCount * (double)_total;
+  double numOfRev = revCount/360.0;
+  return ((2.0*pi*wheelRadius) * numOfRev);
+}
+
+float displacementAvg(long FL, long FR, long RL, long RR, int dir)
+{
+  float sum;
+  int total;
+  float disAvg;
+  
+  switch(dir)
+  {
+    case nw:
+    disAvg = 0;
+    break;
+
+    case n:
+    sum += getDistance(FL);
+    sum += getDistance(FR);
+    sum += getDistance(RL);
+    sum += getDistance(RR); 
+    total = 4;
+    disAvg = sum/(float)total;
+    break;
+
+    case ne:
+    disAvg = 0;
+    break;
+
+    case w:
+    disAvg = 0;
+    break;
+
+    case e:
+    disAvg = 0;
+    break;
+
+    case sw:
+    disAvg = 0;
+    break;
+
+    case s:
+    sum += getDistance(FL);
+    sum += getDistance(FR);
+    sum += getDistance(RL);
+    sum += getDistance(RR);
+    sum = -sum;
+    total = 4;
+    disAvg = sum/(float)total;
+    break;
+
+    case se:
+    disAvg = 0;
+    break;
+  }
+  sum = 0;
+  total = 0;
+  return disAvg;
+}
+
+void resetCount()
+{
+  wheelFL.EncCount = 0; wheelFL.priorCount = 0; wheelFL.totalCount = 0;
+  wheelFR.EncCount = 0; wheelFR.priorCount = 0; wheelFR.totalCount = 0;
+  wheelRL.EncCount = 0; wheelRL.priorCount = 0; wheelRL.totalCount = 0;
+  wheelRR.EncCount = 0; wheelRR.priorCount = 0; wheelRR.totalCount = 0;
+}
+
+double DPStoRPM(double dps)
+{
+  return dps*(0.1666667); // Take the Degrees/Sec of the motor and returns RPM. 1 RPM = 6 deg/s 
+}
+
+double RPMtoWheelSpeed(double rpm)
+{
+  return ((2.0*pi)/1.0)*wheelRadius*rpm;// 1.0 returns m/min, 60.0 returns m/s
+}
